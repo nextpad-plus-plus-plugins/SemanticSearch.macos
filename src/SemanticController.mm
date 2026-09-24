@@ -295,10 +295,18 @@ struct SemSentenceSpan {
             embedded++;
         }
 
+        // Surface WHICH embedding backend ran: "contextual" is Apple's
+        // transformer model (OS-downloaded asset), "sentence" the built-in
+        // static model used until that asset arrives.
+        NSString *backend = @"";
+        if ([(NSObject *)self_->_provider respondsToSelector:@selector(backendName)]) {
+            NSString *bn = ((AppleNLEmbeddingProvider *)self_->_provider).backendName;
+            if (bn.length) backend = [bn stringByAppendingString:@" model · "];
+        }
         NSString *status = sentences.count
-            ? [NSString stringWithFormat:@"%lu of %lu sentences indexed · %@",
+            ? [NSString stringWithFormat:@"%lu of %lu sentences indexed · %@%@",
                 (unsigned long)embedded, (unsigned long)sentences.count,
-                self_->_engine.engineName]
+                backend, self_->_engine.engineName]
             : @"No sentences to search";
         dispatch_async(dispatch_get_main_queue(), ^{
             if (gen != self_->_buildGeneration) return;
