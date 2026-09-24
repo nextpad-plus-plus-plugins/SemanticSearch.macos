@@ -32,6 +32,13 @@ typedef void (^SemanticStatusBlock)(NSString *status, BOOL busy);
 /// Color sensitivity: -1 stricter, 0 standard, 1 broader. Repaints cached hits.
 @property (nonatomic) NSInteger sensitivity;
 
+/// Legend band filter, multi-select: bit i set = band i selected. 0 = show
+/// all bands (default). While any band is selected, only those bands are
+/// painted AND their sentences' first lines carry the host bookmark marker
+/// (F2-navigable); deselecting removes the bookmarks this controller added
+/// (never the user's own). Repaints cached hits.
+@property (nonatomic) NSUInteger bandMask;
+
 /// Attach to the host's CURRENT buffer and (re)build the sentence index.
 /// No-op if already attached to that buffer.
 - (void)attachToCurrentBuffer;
@@ -46,8 +53,11 @@ typedef void (^SemanticStatusBlock)(NSString *status, BOOL busy);
 /// Live query update. Empty clears the heatmap but keeps the index warm.
 - (void)updateQuery:(NSString *)query;
 
-/// Remove all heatmap coloring from the current view.
+/// Remove all heatmap coloring (and our bookmarks) from the current view.
 - (void)clearHeatmap;
+
+/// NPPN_FILECLOSED: forget bookkeeping for a dead buffer id.
+- (void)noteFileClosed:(intptr_t)bufferID;
 
 @end
 

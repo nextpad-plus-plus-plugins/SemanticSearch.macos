@@ -34,4 +34,22 @@ inline uint32_t colorBGR(double score, int sensitivity = 0) {
     return 0x458A0B;
 }
 
+// ── Legend bands (plugin addition, not in PR #346) ──────────────────────────
+// The panel's legend shows six sample points along the ramp; clicking one
+// filters the heatmap to just that band. Classification is by nearest sample
+// in RAW score space — monotonic in score, so band membership is stable
+// across sensitivity changes even though the displayed colors shift.
+inline constexpr double kLegendScores[6] = {0.35, 0.60, 0.75, 0.84, 0.90, 0.93};
+
+inline int bandForScore(double score) {
+    if (!std::isfinite(score)) return -1;
+    int best = 0;
+    double bestDist = 2.0;
+    for (int i = 0; i < 6; ++i) {
+        double d = std::abs(score - kLegendScores[i]);
+        if (d < bestDist) { bestDist = d; best = i; }
+    }
+    return best;
+}
+
 } // namespace SemanticHeatmap

@@ -13,7 +13,9 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <map>
 #include <memory>
+#include <set>
 #include <vector>
 
 // Provided by PluginEntry.mm.
@@ -64,6 +66,11 @@ struct SemSentenceSpan {
     BOOL      _indexReady;
     NSString *_query;
     NSInteger _sensitivity;
+    NSUInteger _bandMask;    // bit i = band i selected; 0 = all bands
+    int        _bookmarkID;  // host bookmark marker (NPPM_GETBOOKMARKID)
+    // Lines WE bookmarked, per buffer — so deselecting a band (or clearing)
+    // removes exactly what we added and never the user's own bookmarks.
+    std::map<intptr_t, std::set<long>> _ourBookmarks;
     std::vector<SemanticHit> _lastHits;
     NSString *_indexStatus;
     NSString *_providerLanguage;
@@ -90,7 +97,27 @@ struct SemSentenceSpan {
     _query = @"";
     _bufferID = 0;
     _indicator = 0;
+    _bandMask = 0;
+    _bookmarkID = -1;
     return self;
+}
+
+- (int)bookmarkID {
+    if (_bookmarkID >= 0) return _bookmarkID;
+    // The host's NPPM_GETBOOKMARKID answers 24 (the Windows NPP number), but
+    // the macOS host's own bookmark marker is 20 (kBookmarkMarker) — a marker
+    // added at 24 is invisible (not in margin 1's mask) and F2 ignores it.
+    // The margin mask tells the truth, so trust what the bookmark margin
+    // actually displays; fall back to the API answer on other hosts.
+    // (Margin 1 also masks the hide-lines arrows, 18/19 — both below 20.)
+    unsigned marginMask = (unsigned)sci(SCI_GETMARGINMASKN, 1);
+    if (marginMask & (1u << 20))      _bookmarkID = 20;
+    else if (marginMask & (1u << 24)) _bookmarkID = 24;
+    else {
+        intptr_t id_ = npp(NPPM_GETBOOKMARKID);
+        _bookmarkID = (id_ > 0 && id_ < 32) ? (int)id_ : 20;
+    }
+    return _bookmarkID;
 }
 
 - (int)indicatorSlot {
@@ -107,6 +134,13 @@ struct SemSentenceSpan {
 
 - (void)setSensitivity:(NSInteger)sensitivity {
     _sensitivity = std::clamp(sensitivity, (NSInteger)-1, (NSInteger)1);
+    [self paintHits:_lastHits];
+}
+
+- (NSUInteger)bandMask { return _bandMask; }
+
+- (void)setBandMask:(NSUInteger)bandMask {
+    _bandMask = bandMask & 0x3F;
     [self paintHits:_lastHits];
 }
 
@@ -376,9 +410,16 @@ struct SemSentenceSpan {
 
     sci(SCI_SETINDICATORCURRENT, ind);
     sci(SCI_INDICATORCLEARRANGE, 0, docLen);
-    if (hits.empty()) return;
+
+    // First lines of the sentences that survive the band filter — these get
+    // the host bookmark marker while any band is selected.
+    std::set<long> wantLines;
 
     for (const SemanticHit &h : hits) {
+        // Legend band filter (multi-select): paint only selected bands so
+        // specific colors can be picked out of an otherwise fully tinted file.
+        if (_bandMask &&
+            !(_bandMask & (1u << SemanticHeatmap::bandForScore(h.score)))) continue;
         size_t idx = (size_t)(h.sentenceID - _firstSentenceID);
         if (idx >= _spans.size()) continue;
         const SemSentenceSpan &span = _spans[idx];
@@ -388,16 +429,59 @@ struct SemSentenceSpan {
         sci(SCI_SETINDICATORVALUE,
             (uptr_t)(SemanticHeatmap::colorBGR(h.score, (int)_sensitivity) | SC_INDICVALUEBIT));
         sci(SCI_INDICATORFILLRANGE, (uptr_t)span.byteStart, len);
+
+        if (_bandMask)
+            wantLines.insert((long)sci(SCI_LINEFROMPOSITION, (uptr_t)span.byteStart));
+    }
+
+    [self syncBookmarksTo:wantLines];
+}
+
+// Reconcile OUR bookmarks on the current buffer with `want`: remove lines we
+// added that are no longer wanted, add newly wanted lines — but never touch a
+// bookmark the user placed (add skips lines already marked; remove only
+// touches lines recorded as ours).
+- (void)syncBookmarksTo:(const std::set<long> &)want {
+    if (_bufferID == 0) return;
+    const int bm = [self bookmarkID];
+    const unsigned mask = 1u << bm;
+    std::set<long> &ours = _ourBookmarks[_bufferID];
+
+    for (auto it = ours.begin(); it != ours.end();) {
+        if (want.count(*it) == 0) {
+            sci(SCI_MARKERDELETE, (uptr_t)*it, bm);
+            it = ours.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (long line : want) {
+        if (ours.count(line)) continue;
+        if ((unsigned)sci(SCI_MARKERGET, (uptr_t)line) & mask) continue; // user's
+        sci(SCI_MARKERADD, (uptr_t)line, bm);
+        ours.insert(line);
     }
 }
 
 - (void)clearHeatmap {
     _lastHits.clear();
     if (_bufferID == 0) return;
+    // Only touch the document if it is still the one we attached to — on a
+    // buffer switch the current view already shows the NEW document, and
+    // line-keyed marker deletes would land in the wrong file. Stale paint
+    // and marks in a background buffer self-heal when it is re-attached.
+    if (npp(NPPM_GETCURRENTBUFFERID) != _bufferID) return;
     if (!_indicatorConfigured) return;   // never touched anything yet
     const int ind = [self indicatorSlot];
     sci(SCI_SETINDICATORCURRENT, ind);
     sci(SCI_INDICATORCLEARRANGE, 0, sci(SCI_GETLENGTH));
+    [self syncBookmarksTo:std::set<long>()];
+}
+
+/// A buffer died — forget its bookmark record so a later buffer-id reuse
+/// can never inherit stale line numbers.
+- (void)noteFileClosed:(intptr_t)bufferID {
+    _ourBookmarks.erase(bufferID);
 }
 
 - (void)reportBuildError:(NSString *)status generation:(uint64_t)generation {

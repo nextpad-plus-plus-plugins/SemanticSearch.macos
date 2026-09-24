@@ -10,6 +10,9 @@ NS_ASSUME_NONNULL_BEGIN
 /// Debounced as the user types; empty string means "clear heatmap".
 - (void)semanticPanelQueryDidChange:(NSString *)query;
 - (void)semanticPanelSensitivityDidChange:(NSInteger)sensitivity;
+/// Legend swatches toggled (multi-select). Bit i set = band i selected.
+/// 0 = nothing selected = show all bands, no bookmarks.
+- (void)semanticPanelBandMaskDidChange:(NSUInteger)mask;
 /// The host hid the panel (PanelFrame ✕ or programmatic hide).
 - (void)semanticPanelDidClose;
 @end

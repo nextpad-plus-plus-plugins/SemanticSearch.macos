@@ -17,13 +17,31 @@ static NSString *configPlistPath(void) {
     return dir.length ? [dir stringByAppendingPathComponent:@"SemanticSearch.plist"] : nil;
 }
 
+// ── Legend swatch: a clickable color square with a selection ring ───────────
+@interface SemSwatchButton : NSButton
+@property (nonatomic) BOOL selectedBand;
+@end
+@implementation SemSwatchButton
+- (void)setSelectedBand:(BOOL)sel {
+    _selectedBand = sel;
+    self.layer.borderWidth = sel ? 2.0 : 0.0;
+}
+- (void)updateLayer {
+    [super updateLayer];
+    // Resolve the ring color for the current appearance (dark mode safe).
+    self.layer.borderColor = NSColor.labelColor.CGColor;
+}
+@end
+
 @implementation SemanticPanel {
     NSTextField *_titleLabel;
     NSTextField *_queryField;
-    NSTextField *_legendLabel;
     NSTextField *_statusLabel;
     NSProgressIndicator *_spinner;
     NSPopUpButton *_sensitivityPopup;
+    NSStackView *_legendStack;
+    NSMutableArray<SemSwatchButton *> *_swatches;
+    NSUInteger _bandMask;               // bit i = band i selected; 0 = all
     NSTimer *_debounceTimer;
 }
 
@@ -65,10 +83,39 @@ static NSString *configPlistPath(void) {
         @"Heatmap sensitivity: Broad colors weaker matches green; Strict "
         @"requires stronger matches. Scores are unchanged.";
 
-    _legendLabel = [NSTextField labelWithAttributedString:[self legendString]];
-    _legendLabel.font = [NSFont systemFontOfSize:11];
-    _legendLabel.toolTip = @"Red: less similar. Grey: intermediate. "
-                           @"Green: more similar.";
+    // Legend: six clickable swatches (least → most similar), multi-select.
+    // Selected bands are the only ones painted, and their lines get
+    // bookmarks (F2-navigable). No selection = show all, no bookmarks.
+    // 16pt squares — 50% larger than the original 11pt glyph legend.
+    _bandMask = 0;
+    _swatches = [NSMutableArray array];
+    _legendStack = [[NSStackView alloc] initWithFrame:NSZeroRect];
+    _legendStack.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    _legendStack.spacing = 4;
+    for (int i = 0; i < 6; i++) {
+        uint32_t bgr = SemanticHeatmap::colorBGR(SemanticHeatmap::kLegendScores[i]);
+        NSColor *c = [NSColor colorWithRed:(bgr & 255) / 255.0
+                                     green:((bgr >> 8) & 255) / 255.0
+                                      blue:((bgr >> 16) & 255) / 255.0 alpha:1];
+        SemSwatchButton *b = [[SemSwatchButton alloc] initWithFrame:NSZeroRect];
+        b.title = @"";
+        b.bordered = NO;
+        b.wantsLayer = YES;
+        b.layer.backgroundColor = c.CGColor;
+        b.layer.cornerRadius = 3.5;
+        b.tag = i;
+        b.target = self;
+        b.action = @selector(swatchClicked:);
+        b.toolTip = @"Show only the selected similarity bands and bookmark "
+                    @"their lines (click again to deselect; multiple bands "
+                    @"can be selected)";
+        [b setAccessibilityLabel:
+            [NSString stringWithFormat:@"Similarity band %d of 6", i + 1]];
+        [b.widthAnchor constraintEqualToConstant:16].active = YES;
+        [b.heightAnchor constraintEqualToConstant:16].active = YES;
+        [_swatches addObject:b];
+        [_legendStack addArrangedSubview:b];
+    }
 
     _spinner = [[NSProgressIndicator alloc] init];
     _spinner.style = NSProgressIndicatorStyleSpinning;
@@ -90,13 +137,13 @@ static NSString *configPlistPath(void) {
         forOrientation:NSLayoutConstraintOrientationHorizontal];
 
     for (NSView *v in @[_titleLabel, _queryField, _sensitivityPopup,
-                        _legendLabel, _spinner, _statusLabel]) {
+                        _legendStack, _spinner, _statusLabel]) {
         v.translatesAutoresizingMaskIntoConstraints = NO;
         [self addSubview:v];
     }
 
     NSDictionary *views = @{ @"lbl": _titleLabel, @"field": _queryField,
-                             @"sens": _sensitivityPopup, @"legend": _legendLabel,
+                             @"sens": _sensitivityPopup, @"legend": _legendStack,
                              @"spin": _spinner, @"status": _statusLabel };
     [NSLayoutConstraint activateConstraints:[NSLayoutConstraint
         constraintsWithVisualFormat:@"H:|-(10)-[lbl]-(6)-[field(>=140)]-(10)-|"
@@ -115,20 +162,11 @@ static NSString *configPlistPath(void) {
     [_debounceTimer invalidate];
 }
 
-- (NSAttributedString *)legendString {
-    static const double scores[] = {0.35, 0.60, 0.75, 0.84, 0.90, 0.93};
-    NSMutableAttributedString *s = [[NSMutableAttributedString alloc] init];
-    for (int i = 0; i < 6; i++) {
-        uint32_t bgr = SemanticHeatmap::colorBGR(scores[i]);
-        NSColor *c = [NSColor colorWithRed:(bgr & 255) / 255.0
-                                     green:((bgr >> 8) & 255) / 255.0
-                                      blue:((bgr >> 16) & 255) / 255.0 alpha:1];
-        [s appendAttributedString:
-            [[NSAttributedString alloc] initWithString:@"■"
-                attributes:@{ NSForegroundColorAttributeName: c,
-                              NSFontAttributeName: [NSFont systemFontOfSize:11] }]];
-    }
-    return s;
+- (void)swatchClicked:(SemSwatchButton *)sender {
+    _bandMask ^= (1u << sender.tag);    // independent toggle per swatch
+    for (SemSwatchButton *b in _swatches)
+        b.selectedBand = (_bandMask & (1u << b.tag)) != 0;
+    [self.delegate semanticPanelBandMaskDidChange:_bandMask];
 }
 
 - (NSInteger)sensitivity { return _sensitivityPopup.indexOfSelectedItem - 1; }

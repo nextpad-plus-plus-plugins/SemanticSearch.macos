@@ -47,6 +47,9 @@ static intptr_t npp(uint32_t msg, uintptr_t w = 0, intptr_t l = 0) {
 - (void)semanticPanelSensitivityDidChange:(NSInteger)sensitivity {
     gController.sensitivity = sensitivity;
 }
+- (void)semanticPanelBandMaskDidChange:(NSUInteger)mask {
+    gController.bandMask = mask;
+}
 - (void)semanticPanelDidClose {
     gPanelShown = false;
     [gController detach];
@@ -178,6 +181,7 @@ extern "C" NPP_EXPORT void beNotified(SCNotification *n) {
 
         case NPPN_FILECLOSED:
             // The attached buffer may be gone; retarget on next activation.
+            if (gController) [gController noteFileClosed:(intptr_t)n->nmhdr.idFrom];
             if (gPanelShown && gController) [gController detach];
             break;
 
