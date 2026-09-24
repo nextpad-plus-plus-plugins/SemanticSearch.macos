@@ -17,7 +17,7 @@
 #include <cstring>
 
 #define PLUGIN_NAME    "Semantic Search"
-#define PLUGIN_VERSION "0.1.0"
+#define PLUGIN_VERSION "1.0.0"
 static const int NB_FUNC = 2;
 
 NppData gNppData;                       // shared with controller/panel
