@@ -81,6 +81,13 @@ static NSString *configPlistPath(void) {
     _statusLabel.lineBreakMode = NSLineBreakByTruncatingTail;
     [_statusLabel setContentCompressionResistancePriority:250
         forOrientation:NSLayoutConstraintOrientationHorizontal];
+    // The bottom row must fill the panel width; the STATUS label absorbs the
+    // slack (invisible — its text is left-aligned and truncates), so the
+    // sensitivity popup stays exactly as wide as its longest item.
+    [_statusLabel setContentHuggingPriority:100
+        forOrientation:NSLayoutConstraintOrientationHorizontal];
+    [_sensitivityPopup setContentHuggingPriority:NSLayoutPriorityDefaultHigh
+        forOrientation:NSLayoutConstraintOrientationHorizontal];
 
     for (NSView *v in @[_titleLabel, _queryField, _sensitivityPopup,
                         _legendLabel, _spinner, _statusLabel]) {
