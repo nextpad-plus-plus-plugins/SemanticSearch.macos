@@ -213,6 +213,45 @@ struct SemSentenceSpan {
     });
 }
 
+// Hop a finished or partial index onto the main thread. The vectors are
+// shared_ptr copies so the worker can keep embedding after this returns.
+- (void)deliverBuild:(uint64_t)gen
+            queryGen:(uint64_t)qGen
+             firstID:(int64_t)firstID
+               spans:(std::shared_ptr<std::vector<SemSentenceSpan>>)spans
+                hits:(std::shared_ptr<std::vector<SemanticHit>>)hits
+               paint:(BOOL)paint
+                done:(BOOL)done
+            embedded:(NSUInteger)nEmbedded
+               total:(NSUInteger)total
+              status:(NSString *)status {
+    auto spansKeep = spans;
+    auto hitsKeep = hits;
+    NSString *statusKeep = [status copy];
+    __weak __typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        __typeof(self) self_ = weakSelf;
+        if (!self_ || gen != self_->_buildGeneration) return;
+        self_->_spans = spansKeep ? *spansKeep : std::vector<SemSentenceSpan>();
+        self_->_firstSentenceID = firstID;
+        self_->_nextSentenceID = firstID + (int64_t)self_->_spans.size();
+        if (paint && hitsKeep && qGen == self_->_queryGeneration.load()) {
+            self_->_lastHits = *hitsKeep;
+            [self_ paintHits:*hitsKeep];
+        }
+        if (done) {
+            self_->_indexReady = YES;
+            self_->_indexStatus = statusKeep;
+            [self_ reportStatus:statusKeep busy:NO];
+            if (self_->_query.length) [self_ runQuery];
+        } else {
+            [self_ reportStatus:[NSString stringWithFormat:@"Indexing %lu of %lu...",
+                                 (unsigned long)nEmbedded, (unsigned long)total]
+                           busy:YES];
+        }
+    });
+}
+
 #pragma mark - Index rebuild
 
 - (void)rebuildIndex {
@@ -327,27 +366,16 @@ struct SemSentenceSpan {
                 hits->resize(got);
                 paint = got == n;
             }
-            NSUInteger nEmbedded = embedded;
-            dispatch_async(dispatch_get_main_queue(), ^{
-                if (gen != self_->_buildGeneration) return;
-                self_->_spans = *spans;
-                self_->_firstSentenceID = firstID;
-                self_->_nextSentenceID = firstID + (int64_t)spans->size();
-                if (paint && qGen == self_->_queryGeneration) {
-                    self_->_lastHits = *hits;
-                    [self_ paintHits:*hits];
-                }
-                if (done) {
-                    self_->_indexReady = YES;
-                    self_->_indexStatus = finalStatus;
-                    [self_ reportStatus:finalStatus busy:NO];
-                    if (self_->_query.length) [self_ runQuery];
-                } else {
-                    [self_ reportStatus:[NSString stringWithFormat:@"Indexing %lu of %lu...",
-                                         (unsigned long)nEmbedded, (unsigned long)total]
-                                   busy:YES];
-                }
-            });
+            [self_ deliverBuild:gen
+                       queryGen:qGen
+                        firstID:firstID
+                          spans:spans
+                           hits:hits
+                          paint:paint
+                           done:done
+                       embedded:embedded
+                          total:total
+                         status:finalStatus];
         };
 
         for (NSUInteger batch = 0; batch < sentences.count; batch += kEmbedBatch) {
