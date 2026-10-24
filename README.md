@@ -19,13 +19,13 @@ plugin.
 - Type a query. The heatmap updates live (debounced). Enter forces an
   immediate run; clearing the field clears the heatmap.
 - **Strict / Standard / Broad** shifts how much similarity is needed to show
-  green. Colors follow the raw cosine of the contextual model. Sensitivity
-  changes the painted color, not the score, and the legend bands stay put.
+  green. Sensitivity changes the painted color, not the score, and the
+  legend bands stay put.
 - When both Apple NaturalLanguage sentence models are present, the panel
   offers **Contextual** (the default) and **Sentence**. The choice is saved
   next to the sensitivity. Contextual mean-pools token embeddings. Sentence
-  is the built-in sentence embedding. The color scale is fit to the
-  contextual range, so sentence-model scores are not stretched to match it.
+  is the built-in sentence embedding. Each model has its own color stops,
+  fit to that model's scores. Switching the model repaints with those stops.
 - The status line counts as indexing proceeds ("Indexing 24 of 80...") and
   then reports the finished index ("48 of 52 sentences indexed · contextual
   model · Metal/MPS"). List markers, bare numbers and other spans without

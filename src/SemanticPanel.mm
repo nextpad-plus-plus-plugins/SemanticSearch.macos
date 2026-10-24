@@ -35,6 +35,20 @@ static NSString *configPlistPath(void) {
 }
 @end
 
+static void colorSwatches(NSArray *swatches, NSString *modelID) {
+    SemanticHeatmap::HeatmapModel model =
+        SemanticHeatmap::heatmapModelFromID(modelID.UTF8String);
+    for (NSUInteger i = 0; i < swatches.count; i++) {
+        double sample = SemanticHeatmap::legendScore(model, (int)i);
+        uint32_t bgr = SemanticHeatmap::colorBGR(sample, 0, model);
+        NSColor *c = [NSColor colorWithRed:(bgr & 255) / 255.0
+                                     green:((bgr >> 8) & 255) / 255.0
+                                      blue:((bgr >> 16) & 255) / 255.0 alpha:1];
+        SemSwatchButton *b = swatches[i];
+        b.layer.backgroundColor = c.CGColor;
+    }
+}
+
 @implementation SemanticPanel {
     NSTextField *_titleLabel;
     NSTextField *_queryField;
@@ -126,7 +140,7 @@ static void saveConfig(NSMutableDictionary *d) {
         _modelPopup.toolTip =
             @"Apple NaturalLanguage model. Contextual mean-pools token "
             @"embeddings. Sentence is the built-in sentence embedding. "
-            @"The color scale is fit to the contextual score range.";
+            @"Each model uses its own color scale.";
     } else {
         _onlyModelID = modelIDs.firstObject ?: @"contextual";
     }
@@ -142,8 +156,8 @@ static void saveConfig(NSMutableDictionary *d) {
         @"requires stronger matches. Scores are unchanged.";
 
     // Legend: six clickable swatches (least to most similar), multi-select.
-    // Swatch colors are the raw score at standard sensitivity, so Strict
-    // and Broad do not move the bands. Selected bands are the only ones
+    // Swatch colors are that model's raw score at standard sensitivity, so
+    // Strict and Broad do not move the bands. Switching models recolors them. Selected bands are the only ones
     // painted, and their lines get bookmarks (F2-navigable). No selection
     // shows every band and adds no bookmarks. 16pt squares.
     _bandMask = 0;
@@ -152,15 +166,10 @@ static void saveConfig(NSMutableDictionary *d) {
     _legendStack.orientation = NSUserInterfaceLayoutOrientationHorizontal;
     _legendStack.spacing = 4;
     for (int i = 0; i < 6; i++) {
-        uint32_t bgr = SemanticHeatmap::colorBGR(SemanticHeatmap::kLegendScores[i]);
-        NSColor *c = [NSColor colorWithRed:(bgr & 255) / 255.0
-                                     green:((bgr >> 8) & 255) / 255.0
-                                      blue:((bgr >> 16) & 255) / 255.0 alpha:1];
         SemSwatchButton *b = [[SemSwatchButton alloc] initWithFrame:NSZeroRect];
         b.title = @"";
         b.bordered = NO;
         b.wantsLayer = YES;
-        b.layer.backgroundColor = c.CGColor;
         b.layer.cornerRadius = 3.5;
         b.tag = i;
         b.target = self;
@@ -175,6 +184,7 @@ static void saveConfig(NSMutableDictionary *d) {
         [_swatches addObject:b];
         [_legendStack addArrangedSubview:b];
     }
+    colorSwatches(_swatches, self.modelID);
 
     _spinner = [[NSProgressIndicator alloc] init];
     _spinner.style = NSProgressIndicatorStyleSpinning;
@@ -252,6 +262,7 @@ static void saveConfig(NSMutableDictionary *d) {
 }
 
 - (void)modelChanged:(id)sender {
+    colorSwatches(_swatches, self.modelID);
     [SemanticPanel saveModelID:self.modelID];
     [self.delegate semanticPanelModelDidChange:self.modelID];
 }

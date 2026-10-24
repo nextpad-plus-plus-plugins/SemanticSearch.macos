@@ -536,8 +536,10 @@ struct SemSentenceSpan {
     for (const SemanticHit &h : hits) {
         // Legend band filter (multi-select): paint only selected bands so
         // specific colors can be picked out of an otherwise fully tinted file.
+        SemanticHeatmap::HeatmapModel model =
+            SemanticHeatmap::heatmapModelFromID(_modelID.UTF8String);
         if (_bandMask &&
-            !(_bandMask & (1u << SemanticHeatmap::bandForScore(h.score)))) continue;
+            !(_bandMask & (1u << SemanticHeatmap::bandForScore(h.score, model)))) continue;
         size_t idx = (size_t)(h.sentenceID - _firstSentenceID);
         if (idx >= _spans.size()) continue;
         const SemSentenceSpan &span = _spans[idx];
@@ -545,7 +547,7 @@ struct SemSentenceSpan {
         long len = std::min((long)span.byteLength, (long)(docLen - span.byteStart));
 
         sci(SCI_SETINDICATORVALUE,
-            (uptr_t)(SemanticHeatmap::colorBGR(h.score, (int)_sensitivity) | SC_INDICVALUEBIT));
+            (uptr_t)(SemanticHeatmap::colorBGR(h.score, (int)_sensitivity, model) | SC_INDICVALUEBIT));
         sci(SCI_INDICATORFILLRANGE, (uptr_t)span.byteStart, len);
 
         if (_bandMask)
