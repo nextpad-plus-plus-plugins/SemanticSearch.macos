@@ -6,16 +6,29 @@
 
 namespace SemanticHeatmap {
 
-// -1: stricter matches, 0: original ramp, 1: broader matches.
+/* -1 stricter, 0 standard, 1 broader. Scores are not rescaled.
+ *
+ * The stops sit on the cosine range of Apple's contextual sentence
+ * embedding (NLContextualEmbedding, mean-pooled, then L2-normalized).
+ * On a mix of paraphrases, related sentences and unrelated sentences
+ * that range was min 0.825, max 1.000, mean 0.911. Unrelated text sat
+ * near 0.83, a paraphrase near 0.93, and only the same sentence reached
+ * 1. A ramp that stayed red through 0.35 and turned green only past
+ * 0.90 painted that whole spread nearly one green.
+ *
+ * The built-in NLEmbedding sentence model on the same text ran from
+ * 0.087 to 1.000, mean 0.392. Those scores are not stretched onto this
+ * ramp.
+ */
 inline uint32_t colorBGR(double score, int sensitivity = 0) {
     static constexpr struct { double score; int r, g, b; } stops[] = {
         {0.00, 0xD6, 0x45, 0x41},
-        {0.35, 0xD6, 0x45, 0x41},
-        {0.60, 0xB2, 0x69, 0x64},
-        {0.72, 0x8E, 0x8E, 0x8E},
-        {0.78, 0x8E, 0x8E, 0x8E},
-        {0.90, 0x2E, 0xCC, 0x71},
-        {0.93, 0x0B, 0x8A, 0x45},
+        {0.82, 0xD6, 0x45, 0x41},
+        {0.85, 0xB2, 0x69, 0x64},
+        {0.88, 0x8E, 0x8E, 0x8E},
+        {0.90, 0x8E, 0x8E, 0x8E},
+        {0.92, 0x2E, 0xCC, 0x71},
+        {0.95, 0x0B, 0x8A, 0x45},
         {1.00, 0x0B, 0x8A, 0x45},
     };
     if (!std::isfinite(score)) return 0x8E8E8E;
@@ -34,12 +47,11 @@ inline uint32_t colorBGR(double score, int sensitivity = 0) {
     return 0x458A0B;
 }
 
-// ── Legend bands (plugin addition, not in PR #346) ──────────────────────────
-// The panel's legend shows six sample points along the ramp; clicking one
-// filters the heatmap to just that band. Classification is by nearest sample
-// in RAW score space — monotonic in score, so band membership is stable
-// across sensitivity changes even though the displayed colors shift.
-inline constexpr double kLegendScores[6] = {0.35, 0.60, 0.75, 0.84, 0.90, 0.93};
+/* Six legend samples along the measured range. Band membership is the
+ * nearest sample in raw score space, so a band does not move when
+ * sensitivity changes the painted colors. Swatches are colored with
+ * sensitivity 0. */
+inline constexpr double kLegendScores[6] = {0.83, 0.86, 0.89, 0.91, 0.93, 0.96};
 
 inline int bandForScore(double score) {
     if (!std::isfinite(score)) return -1;

@@ -10,6 +10,8 @@ NS_ASSUME_NONNULL_BEGIN
 /// Debounced as the user types; empty string means "clear heatmap".
 - (void)semanticPanelQueryDidChange:(NSString *)query;
 - (void)semanticPanelSensitivityDidChange:(NSInteger)sensitivity;
+/// @"contextual" or @"sentence".
+- (void)semanticPanelModelDidChange:(NSString *)modelID;
 /// Legend swatches toggled (multi-select). Bit i set = band i selected.
 /// 0 = nothing selected = show all bands, no bookmarks.
 - (void)semanticPanelBandMaskDidChange:(NSUInteger)mask;
@@ -21,12 +23,13 @@ NS_ASSUME_NONNULL_BEGIN
 
 @property (nonatomic, weak, nullable) id<SemanticPanelDelegate> delegate;
 @property (nonatomic, readonly) NSInteger sensitivity;   // -1 / 0 / 1
+@property (nonatomic, readonly, copy) NSString *modelID; // @"contextual" or @"sentence"
 @property (nonatomic, readonly, copy) NSString *query;
 
 /// Make the query field first responder.
 - (void)activate;
 
-/// Show pipeline status ("Indexing…", "N sentences · Metal/MPS", errors).
+/// Show pipeline status ("Indexing N of M...", "N of M sentences indexed", errors).
 - (void)setStatus:(NSString *)text busy:(BOOL)busy;
 
 /// Persisted sensitivity (plugin Config dir), loaded at creation.

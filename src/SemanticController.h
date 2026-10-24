@@ -25,12 +25,16 @@ typedef void (^SemanticStatusBlock)(NSString *status, BOOL busy);
 /// YES on macOS 14+ (model/GPU availability is validated lazily).
 + (BOOL)isFeatureAvailable;
 
-/// Status sink ("Indexing…", "N sentences · Metal/MPS", errors). Always
-/// called on the main thread.
+/// Status sink ("Indexing N of M...", "N of M sentences indexed", errors).
+/// Always called on the main thread.
 @property (nonatomic, copy, nullable) SemanticStatusBlock statusBlock;
 
 /// Color sensitivity: -1 stricter, 0 standard, 1 broader. Repaints cached hits.
 @property (nonatomic) NSInteger sensitivity;
+
+/// Embedding model id: @"contextual" or @"sentence". Changing it drops the
+/// cache and rebuilds the current buffer. The panel persists the choice.
+@property (nonatomic, copy) NSString *modelID;
 
 /// Legend band filter, multi-select: bit i set = band i selected. 0 = show
 /// all bands (default). While any band is selected, only those bands are

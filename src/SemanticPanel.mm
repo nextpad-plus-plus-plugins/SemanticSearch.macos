@@ -2,6 +2,8 @@
 #import "SemanticPanel.h"
 #include "NppPluginInterfaceMac.h"
 #include "SemanticHeatmapColors.h"
+#import "AppleNLEmbeddingProvider.h"
+#import <NaturalLanguage/NaturalLanguage.h>
 #include <algorithm>
 
 extern NppData gNppData;
@@ -38,25 +40,51 @@ static NSString *configPlistPath(void) {
     NSTextField *_queryField;
     NSTextField *_statusLabel;
     NSProgressIndicator *_spinner;
+    NSPopUpButton *_modelPopup;
     NSPopUpButton *_sensitivityPopup;
+    NSString *_onlyModelID;
     NSStackView *_legendStack;
     NSMutableArray<SemSwatchButton *> *_swatches;
     NSUInteger _bandMask;               // bit i = band i selected; 0 = all
     NSTimer *_debounceTimer;
 }
 
-+ (NSInteger)savedSensitivity {
+static NSMutableDictionary *loadConfig(void) {
     NSString *path = configPlistPath();
-    if (!path) return 0;
+    if (!path) return [NSMutableDictionary dictionary];
     NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:path];
-    NSInteger v = [d[@"sensitivity"] integerValue];
+    return d ? [d mutableCopy] : [NSMutableDictionary dictionary];
+}
+
+static void saveConfig(NSMutableDictionary *d) {
+    NSString *path = configPlistPath();
+    if (!path || !d) return;
+    [d writeToFile:path atomically:YES];
+}
+
++ (NSInteger)savedSensitivity {
+    NSInteger v = [loadConfig()[@"sensitivity"] integerValue];
     return std::clamp(v, (NSInteger)-1, (NSInteger)1);
 }
 
 + (void)saveSensitivity:(NSInteger)v {
-    NSString *path = configPlistPath();
-    if (!path) return;
-    [@{ @"sensitivity": @(v) } writeToFile:path atomically:YES];
+    NSMutableDictionary *d = loadConfig();
+    d[@"sensitivity"] = @(v);
+    saveConfig(d);
+}
+
++ (NSString *)savedModelID {
+    NSString *model = loadConfig()[@"model"];
+    if ([model isEqualToString:@"sentence"] || [model isEqualToString:@"contextual"])
+        return model;
+    return @"contextual";
+}
+
++ (void)saveModelID:(NSString *)modelID {
+    if (modelID.length == 0) return;
+    NSMutableDictionary *d = loadConfig();
+    d[@"model"] = modelID;
+    saveConfig(d);
 }
 
 - (instancetype)initWithFrame:(NSRect)frame {
@@ -73,6 +101,36 @@ static NSString *configPlistPath(void) {
     [[_queryField cell] setScrollable:YES];
     [_queryField setAccessibilityLabel:@"Semantic search query"];
 
+    // Contextual and the built-in sentence embedding are both sentence
+    // models. Show the choice only when this Mac can construct both.
+    NSArray<NSString *> *modelIDs = nil;
+    if (@available(macOS 14.0, *))
+        modelIDs = [AppleNLEmbeddingProvider modelIDsForLanguage:NLLanguageEnglish];
+    if (modelIDs.count >= 2) {
+        _modelPopup = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
+        _modelPopup.controlSize = NSControlSizeSmall;
+        _modelPopup.target = self;
+        _modelPopup.action = @selector(modelChanged:);
+        [_modelPopup addItemWithTitle:@"Contextual"];
+        _modelPopup.lastItem.representedObject = @"contextual";
+        [_modelPopup addItemWithTitle:@"Sentence"];
+        _modelPopup.lastItem.representedObject = @"sentence";
+        NSString *savedModel = [SemanticPanel savedModelID];
+        for (NSMenuItem *item in _modelPopup.itemArray) {
+            if ([item.representedObject isEqualToString:savedModel]) {
+                [_modelPopup selectItem:item];
+                break;
+            }
+        }
+        [_modelPopup setAccessibilityLabel:@"Embedding model"];
+        _modelPopup.toolTip =
+            @"Apple NaturalLanguage model. Contextual mean-pools token "
+            @"embeddings. Sentence is the built-in sentence embedding. "
+            @"The color scale is fit to the contextual score range.";
+    } else {
+        _onlyModelID = modelIDs.firstObject ?: @"contextual";
+    }
+
     _sensitivityPopup = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
     _sensitivityPopup.controlSize = NSControlSizeSmall;
     _sensitivityPopup.target = self;
@@ -83,10 +141,11 @@ static NSString *configPlistPath(void) {
         @"Heatmap sensitivity: Broad colors weaker matches green; Strict "
         @"requires stronger matches. Scores are unchanged.";
 
-    // Legend: six clickable swatches (least → most similar), multi-select.
-    // Selected bands are the only ones painted, and their lines get
-    // bookmarks (F2-navigable). No selection = show all, no bookmarks.
-    // 16pt squares — 50% larger than the original 11pt glyph legend.
+    // Legend: six clickable swatches (least to most similar), multi-select.
+    // Swatch colors are the raw score at standard sensitivity, so Strict
+    // and Broad do not move the bands. Selected bands are the only ones
+    // painted, and their lines get bookmarks (F2-navigable). No selection
+    // shows every band and adds no bookmarks. 16pt squares.
     _bandMask = 0;
     _swatches = [NSMutableArray array];
     _legendStack = [[NSStackView alloc] initWithFrame:NSZeroRect];
@@ -136,18 +195,29 @@ static NSString *configPlistPath(void) {
     [_sensitivityPopup setContentHuggingPriority:NSLayoutPriorityDefaultHigh
         forOrientation:NSLayoutConstraintOrientationHorizontal];
 
-    for (NSView *v in @[_titleLabel, _queryField, _sensitivityPopup,
-                        _legendStack, _spinner, _statusLabel]) {
+    NSMutableArray<NSView *> *rowViews = [NSMutableArray arrayWithObjects:
+        _titleLabel, _queryField, _sensitivityPopup, _legendStack, _spinner, _statusLabel, nil];
+    if (_modelPopup) [rowViews addObject:_modelPopup];
+    for (NSView *v in rowViews) {
         v.translatesAutoresizingMaskIntoConstraints = NO;
         [self addSubview:v];
     }
 
-    NSDictionary *views = @{ @"lbl": _titleLabel, @"field": _queryField,
-                             @"sens": _sensitivityPopup, @"legend": _legendStack,
-                             @"spin": _spinner, @"status": _statusLabel };
-    [NSLayoutConstraint activateConstraints:[NSLayoutConstraint
-        constraintsWithVisualFormat:@"H:|-(10)-[lbl]-(6)-[field(>=140)]-(10)-|"
-                           options:NSLayoutFormatAlignAllCenterY metrics:nil views:views]];
+    NSMutableDictionary *views = [@{ @"lbl": _titleLabel, @"field": _queryField,
+                                     @"sens": _sensitivityPopup, @"legend": _legendStack,
+                                     @"spin": _spinner, @"status": _statusLabel } mutableCopy];
+    if (_modelPopup) {
+        views[@"model"] = _modelPopup;
+        [_modelPopup setContentHuggingPriority:NSLayoutPriorityDefaultHigh
+            forOrientation:NSLayoutConstraintOrientationHorizontal];
+        [NSLayoutConstraint activateConstraints:[NSLayoutConstraint
+            constraintsWithVisualFormat:@"H:|-(10)-[lbl]-(6)-[field(>=120)]-(8)-[model]-(10)-|"
+                               options:NSLayoutFormatAlignAllCenterY metrics:nil views:views]];
+    } else {
+        [NSLayoutConstraint activateConstraints:[NSLayoutConstraint
+            constraintsWithVisualFormat:@"H:|-(10)-[lbl]-(6)-[field(>=140)]-(10)-|"
+                               options:NSLayoutFormatAlignAllCenterY metrics:nil views:views]];
+    }
     [NSLayoutConstraint activateConstraints:[NSLayoutConstraint
         constraintsWithVisualFormat:@"H:|-(10)-[sens]-(8)-[legend]-(8)-[spin(16)]-(6)-[status(>=0)]-(10)-|"
                            options:NSLayoutFormatAlignAllCenterY metrics:nil views:views]];
@@ -171,6 +241,20 @@ static NSString *configPlistPath(void) {
 
 - (NSInteger)sensitivity { return _sensitivityPopup.indexOfSelectedItem - 1; }
 - (NSString *)query      { return _queryField.stringValue; }
+
+- (NSString *)modelID {
+    if (_modelPopup) {
+        NSString *model = _modelPopup.selectedItem.representedObject;
+        if ([model isEqualToString:@"sentence"] || [model isEqualToString:@"contextual"])
+            return model;
+    }
+    return _onlyModelID ?: @"contextual";
+}
+
+- (void)modelChanged:(id)sender {
+    [SemanticPanel saveModelID:self.modelID];
+    [self.delegate semanticPanelModelDidChange:self.modelID];
+}
 
 - (void)sensitivityChanged:(id)sender {
     [SemanticPanel saveSensitivity:self.sensitivity];

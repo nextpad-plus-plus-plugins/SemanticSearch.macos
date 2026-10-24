@@ -9,6 +9,7 @@
 #import "MetalSimilarityEngine.h"
 #import "SpillableVectorIndex.h"
 #include "SemanticHeatmapColors.h"
+#import "SegmentContent.h"
 #import <NaturalLanguage/NaturalLanguage.h>
 #include <algorithm>
 #include <atomic>
@@ -41,6 +42,7 @@ static const int kFallbackIndicator = 20;
 static const long       kMaxDocBytes  = 2 * 1024 * 1024;
 static const NSUInteger kMaxSentences = 4096;
 static const int64_t    kRebuildDebounceNs = (int64_t)(0.6 * NSEC_PER_SEC);
+static const NSUInteger kEmbedBatch = 8;
 
 struct SemSentenceSpan {
     long byteStart;
@@ -74,6 +76,8 @@ struct SemSentenceSpan {
     std::vector<SemanticHit> _lastHits;
     NSString *_indexStatus;
     NSString *_providerLanguage;
+    NSString *_modelID;          // "contextual" or "sentence"
+    NSString *_loadedModelID;    // model the current provider was built for
 
     std::atomic<uint64_t> _buildGeneration;
     std::atomic<uint64_t> _queryGeneration;
@@ -95,6 +99,7 @@ struct SemSentenceSpan {
     _embedCache = [[NSCache alloc] init];
     _embedCache.countLimit = 3 * kMaxSentences;
     _query = @"";
+    _modelID = @"contextual";
     _bufferID = 0;
     _indicator = 0;
     _bandMask = 0;
@@ -142,6 +147,16 @@ struct SemSentenceSpan {
 - (void)setBandMask:(NSUInteger)bandMask {
     _bandMask = bandMask & 0x3F;
     [self paintHits:_lastHits];
+}
+
+- (NSString *)modelID { return _modelID ?: @"contextual"; }
+
+- (void)setModelID:(NSString *)modelID {
+    NSString *next = modelID.length ? modelID : @"contextual";
+    if ([_modelID isEqualToString:next]) return;
+    _modelID = [next copy];
+    [_embedCache removeAllObjects];
+    if (_bufferID != 0) [self rebuildIndex];
 }
 
 #pragma mark - Attach / detach
@@ -218,7 +233,10 @@ struct SemSentenceSpan {
                              : [NSData data];
 
     int64_t firstID = _nextSentenceID;
-    [self reportStatus:@"Indexing…" busy:YES];
+    NSString *query = _query ?: @"";
+    uint64_t qGen = _queryGeneration.load();
+    NSString *modelID = _modelID ?: @"contextual";
+    [self reportStatus:@"Indexing..." busy:YES];
 
     __weak __typeof(self) weakSelf = self;
     dispatch_async(_workQueue, ^{
@@ -249,9 +267,9 @@ struct SemSentenceSpan {
                 lastU16  = NSMaxRange(r);
                 lastByte = byteStart + byteLen;
 
-                NSString *trimmed = [sentence stringByTrimmingCharactersInSet:
-                    NSCharacterSet.whitespaceAndNewlineCharacterSet];
-                if (trimmed.length == 0) return;
+                // List markers and other spans without two letter-words are
+                // not embedded and not painted.
+                if (!segment_has_content(sentence)) return;
 
                 [sentences addObject:sentence];
                 spans->push_back(SemSentenceSpan{ byteStart, byteLen });
@@ -264,87 +282,151 @@ struct SemSentenceSpan {
                 : @"Document has too many sentences for semantic search" generation:gen];
             return;
         }
-        NSString *pipelineError = sentences.count ? [self_ ensurePipelineForSample:text] : nil;
+        if (sentences.count == 0) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (gen != self_->_buildGeneration) return;
+                self_->_spans.clear();
+                self_->_firstSentenceID = firstID;
+                self_->_nextSentenceID = firstID;
+                self_->_indexReady = YES;
+                self_->_indexStatus = @"No sentences to search";
+                [self_ reportStatus:self_->_indexStatus busy:NO];
+            });
+            return;
+        }
+        NSString *pipelineError = [self_ ensurePipelineForSample:text modelID:modelID];
         if (pipelineError) {
             [self_ reportBuildError:pipelineError generation:gen];
             return;
         }
 
         NSUInteger dim = self_->_provider.dimension;
+        NSString *backendName = @"";
+        if (@available(macOS 14.0, *))
+            backendName = ((AppleNLEmbeddingProvider *)self_->_provider).backendName ?: @"";
         [self_->_index resetWithDimension:dim];
-        std::vector<float> scratch(dim);
-        int64_t sid = firstID;
-        NSUInteger embedded = 0;
-        for (NSString *s in sentences) {
-            if (gen != self_->_buildGeneration) return;
-            NSData *cached = [self_->_embedCache objectForKey:s];
-            if (cached.length == dim * sizeof(float)) {
-                memcpy(scratch.data(), cached.bytes, cached.length);
-            } else if ([self_->_provider embedString:s into:scratch.data()]) {
-                [self_->_embedCache setObject:[NSData dataWithBytes:scratch.data()
-                                                             length:dim * sizeof(float)]
-                                       forKey:s];
-            } else {
-                sid++;                 // keep ids aligned; leave unpaintable
-                continue;
-            }
-            if (![self_->_index addVector:scratch.data() sentenceID:sid++]) {
-                [self_ reportBuildError:@"Could not store sentence embeddings" generation:gen];
-                return;
-            }
-            embedded++;
-        }
 
-        // Surface WHICH embedding backend ran: "contextual" is Apple's
-        // transformer model (OS-downloaded asset), "sentence" the built-in
-        // static model used until that asset arrives.
-        NSString *backend = @"";
-        if ([(NSObject *)self_->_provider respondsToSelector:@selector(backendName)]) {
-            NSString *bn = ((AppleNLEmbeddingProvider *)self_->_provider).backendName;
-            if (bn.length) backend = [bn stringByAppendingString:@" model · "];
-        }
-        NSString *status = sentences.count
-            ? [NSString stringWithFormat:@"%lu of %lu sentences indexed · %@%@",
-                (unsigned long)embedded, (unsigned long)sentences.count,
-                backend, self_->_engine.engineName]
-            : @"No sentences to search";
-        dispatch_async(dispatch_get_main_queue(), ^{
+        std::vector<float> qVec(dim);
+        BOOL haveQuery = NO;
+        if (query.length && qGen == self_->_queryGeneration.load())
+            haveQuery = [self_->_provider embedString:query into:qVec.data()];
+
+        std::vector<float> scratch(dim);
+        NSUInteger embedded = 0;
+        NSUInteger total = sentences.count;
+        auto publish = [&](BOOL done, NSString *finalStatus) {
             if (gen != self_->_buildGeneration) return;
-            self_->_spans = *spans;
-            self_->_firstSentenceID = firstID;
-            self_->_nextSentenceID  = firstID + (int64_t)spans->size();
-            self_->_indexReady = YES;
-            self_->_indexStatus = status;
-            [self_ reportStatus:status busy:NO];
-            if (self_->_query.length) [self_ runQuery];
-        });
+            auto hits = std::make_shared<std::vector<SemanticHit>>();
+            BOOL paint = NO;
+            if (haveQuery && qGen == self_->_queryGeneration.load() && self_->_index.count) {
+                NSUInteger n = self_->_index.count;
+                hits->resize(n);
+                NSUInteger got = [self_->_index scoreAllForQuery:qVec.data()
+                                                            hits:hits->data()
+                                                        capacity:n];
+                hits->resize(got);
+                paint = got == n;
+            }
+            NSUInteger nEmbedded = embedded;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (gen != self_->_buildGeneration) return;
+                self_->_spans = *spans;
+                self_->_firstSentenceID = firstID;
+                self_->_nextSentenceID = firstID + (int64_t)spans->size();
+                if (paint && qGen == self_->_queryGeneration) {
+                    self_->_lastHits = *hits;
+                    [self_ paintHits:*hits];
+                }
+                if (done) {
+                    self_->_indexReady = YES;
+                    self_->_indexStatus = finalStatus;
+                    [self_ reportStatus:finalStatus busy:NO];
+                    if (self_->_query.length) [self_ runQuery];
+                } else {
+                    [self_ reportStatus:[NSString stringWithFormat:@"Indexing %lu of %lu...",
+                                         (unsigned long)nEmbedded, (unsigned long)total]
+                                   busy:YES];
+                }
+            });
+        };
+
+        for (NSUInteger batch = 0; batch < sentences.count; batch += kEmbedBatch) {
+            if (gen != self_->_buildGeneration) return;
+            NSUInteger end = std::min(batch + kEmbedBatch, sentences.count);
+            for (NSUInteger i = batch; i < end; i++) {
+                if (gen != self_->_buildGeneration) return;
+                NSString *s = sentences[i];
+                NSString *cacheKey = [NSString stringWithFormat:@"%@\t%lu\t%@",
+                                       backendName, (unsigned long)dim, s];
+                NSData *cached = [self_->_embedCache objectForKey:cacheKey];
+                BOOL ok = NO;
+                if (cached.length == dim * sizeof(float)) {
+                    memcpy(scratch.data(), cached.bytes, cached.length);
+                    ok = YES;
+                } else if ([self_->_provider embedString:s into:scratch.data()]) {
+                    [self_->_embedCache setObject:[NSData dataWithBytes:scratch.data()
+                                                                 length:dim * sizeof(float)]
+                                           forKey:cacheKey];
+                    ok = YES;
+                }
+                if (!ok) continue;   // id stays aligned with the span index
+                int64_t sid = firstID + (int64_t)i;
+                if (![self_->_index addVector:scratch.data() sentenceID:sid]) {
+                    [self_ reportBuildError:@"Could not store sentence embeddings" generation:gen];
+                    return;
+                }
+                embedded++;
+            }
+            BOOL last = end == sentences.count;
+            if (!last) publish(NO, nil);
+        }
+        if (gen != self_->_buildGeneration) return;
+
+        NSString *backend = backendName.length
+            ? [backendName stringByAppendingString:@" model · "] : @"";
+        NSString *status = [NSString stringWithFormat:@"%lu of %lu sentences indexed · %@%@",
+                            (unsigned long)embedded, (unsigned long)sentences.count,
+                            backend, self_->_engine.engineName];
+        NSString *note = nil;
+        if (@available(macOS 14.0, *))
+            note = ((AppleNLEmbeddingProvider *)self_->_provider).fallbackNote;
+        if (note.length) status = [status stringByAppendingFormat:@" %@", note];
+        publish(YES, status);
     });
 }
 
 // Create provider / engine / index on first use (work queue). Returns nil on
 // success or a user-facing error. Fail-loud: no CPU fallback.
-- (nullable NSString *)ensurePipelineForSample:(nullable NSString *)sampleText {
+- (nullable NSString *)ensurePipelineForSample:(nullable NSString *)sampleText
+                                       modelID:(NSString *)modelID {
     NSString *lang = sampleText.length
         ? [NLLanguageRecognizer dominantLanguageForString:sampleText] : nil;
     lang = lang ?: NLLanguageEnglish;
-    if (![_providerLanguage isEqualToString:lang]) {
+    NSString *want = modelID.length ? modelID : @"contextual";
+    BOOL langChanged = ![_providerLanguage isEqualToString:lang];
+    BOOL modelChanged = ![_loadedModelID isEqualToString:want];
+    if (langChanged || modelChanged) {
         _provider = nil;
         [_embedCache removeAllObjects];
         _providerLanguage = [lang copy];
+        _loadedModelID = nil;
     }
-    if (_provider && _provider.isAvailable && _engine) return nil;
+    if (_provider && _provider.isAvailable && _engine && _loadedModelID) return nil;
     if (@available(macOS 14.0, *)) {
         if (!_engine) {
             _engine = [MetalSimilarityEngine engineIfAvailable];
             if (!_engine)
-                return @"Metal GPU unavailable — semantic search disabled";
+                return @"Metal GPU unavailable. Semantic search is disabled.";
         }
         if (!_provider || !_provider.isAvailable) {
-            _provider = [[AppleNLEmbeddingProvider alloc] initWithLanguageHint:lang];
+            _provider = [[AppleNLEmbeddingProvider alloc] initWithLanguageHint:lang
+                                                                       modelID:want];
             if (!_provider.isAvailable) {
                 _provider = nil;
+                _loadedModelID = nil;
                 return @"Embedding model unavailable on this Mac";
             }
+            _loadedModelID = [want copy];
         }
         if (!_index) _index = [[SpillableVectorIndex alloc] initWithSimilarityEngine:_engine];
         return nil;

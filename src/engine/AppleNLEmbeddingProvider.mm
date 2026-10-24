@@ -14,46 +14,63 @@ static BOOL nppL2Normalize(float *v, NSUInteger dim) {
 }
 
 @implementation AppleNLEmbeddingProvider {
-    NLContextualEmbedding *_contextual;   // preferred (macOS 14+)
-    NLEmbedding           *_sentence;     // fallback (static sentence embedding)
+    NLContextualEmbedding *_contextual;   // preferred when the caller asks for it
+    NLEmbedding           *_sentence;     // static sentence embedding
     NLLanguage             _language;
     NSUInteger             _dimension;
 }
 
 @synthesize backendName = _backendName;
+@synthesize fallbackNote = _fallbackNote;
 
-- (instancetype)initWithLanguageHint:(nullable NSString *)languageHint {
++ (NSArray<NSString *> *)modelIDsForLanguage:(NSString *)language {
+    NLLanguage lang = language.length ? language : NLLanguageEnglish;
+    NSMutableArray<NSString *> *ids = [NSMutableArray array];
+    if (@available(macOS 14.0, *)) {
+        if ([NLContextualEmbedding contextualEmbeddingWithLanguage:lang])
+            [ids addObject:@"contextual"];
+    }
+    if ([NLEmbedding sentenceEmbeddingForLanguage:lang])
+        [ids addObject:@"sentence"];
+    return ids;
+}
+
+- (instancetype)initWithLanguageHint:(NSString *)languageHint
+                              modelID:(NSString *)modelID {
     self = [super init];
     if (!self) return nil;
 
     _language = languageHint.length ? languageHint : NLLanguageEnglish;
+    BOOL wantSentence = [modelID isEqualToString:@"sentence"];
 
-    // ── Preferred: contextual token embedding, mean-pooled per sentence ──────
-    NLContextualEmbedding *ctx = [NLContextualEmbedding contextualEmbeddingWithLanguage:_language];
-
-    if (ctx) {
-        if (ctx.hasAvailableAssets) {
-            NSError *err = nil;
-            if ([ctx loadWithError:&err]) {
-                _contextual = ctx;
-                _dimension  = ctx.dimension;
-                _backendName = @"contextual";
+    if (!wantSentence) {
+        NLContextualEmbedding *ctx =
+            [NLContextualEmbedding contextualEmbeddingWithLanguage:_language];
+        if (ctx) {
+            if (ctx.hasAvailableAssets) {
+                NSError *err = nil;
+                if ([ctx loadWithError:&err]) {
+                    _contextual = ctx;
+                    _dimension = ctx.dimension;
+                    _backendName = @"contextual";
+                }
+            } else {
+                // Ask macOS to fetch the asset for a later launch. This
+                // session uses the built-in sentence model instead.
+                [ctx requestEmbeddingAssetsWithCompletionHandler:
+                    ^(NLContextualEmbeddingAssetsResult result, NSError *error) {}];
             }
-        } else {
-            // Request the on-demand asset download for future launches; use
-            // the static sentence embedding for this session.
-            [ctx requestEmbeddingAssetsWithCompletionHandler:
-                ^(NLContextualEmbeddingAssetsResult result, NSError *_Nullable error) { /* fire-and-forget */ }];
         }
     }
 
-    // ── Fallback: static sentence embedding (no asset download needed) ───────
     if (!_contextual) {
         NLEmbedding *sent = [NLEmbedding sentenceEmbeddingForLanguage:_language];
         if (sent) {
-            _sentence   = sent;
-            _dimension  = sent.dimension;
+            _sentence = sent;
+            _dimension = sent.dimension;
             _backendName = @"sentence";
+            if (!wantSentence)
+                _fallbackNote = @"Contextual assets are not installed yet, so the sentence model is running.";
         }
     }
 

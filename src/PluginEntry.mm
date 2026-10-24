@@ -1,12 +1,12 @@
-// SemanticSearch.macos — semantic sentence heatmap search for Nextpad++.
+// SemanticSearch.macos: semantic sentence heatmap search for Nextpad++.
 //
 // Based on nextpad-plus-plus-macos PR #346 by Kristian Rickert (@krickert):
 // describe what you're looking for and every sentence in the document is
-// tinted red → grey → green by semantic similarity. Apple NaturalLanguage
+// tinted red, grey, then green by semantic similarity. Apple NaturalLanguage
 // embeddings + Metal/MPS scoring, entirely on-device. Requires macOS 14+
 // at runtime (the plugin loads from macOS 12 and gates itself).
 //
-// PluginEntry.mm — plugin contract: menu, docked-panel registration (the
+// PluginEntry.mm: plugin contract, menu, docked-panel registration (the
 // Windows-named docking API with the legacy surface as fallback),
 // notification routing.
 #import <Cocoa/Cocoa.h>
@@ -15,6 +15,36 @@
 #import "SemanticPanel.h"
 #import "SemanticController.h"
 #include <cstring>
+
+// The 1.1.1 host reads this Windows docking record from NPPM_DMMREGASDCKDLG.
+// The public plugin header names that message but does not define the record,
+// so the layout is declared here. Field order matches the host method
+// regAsDockingDlgWithData: (client, name, dialog id, mask, icon, extra text,
+// floating rect, previous container, module name).
+#ifndef NPPM_DMM_SETPANELINFO
+#define NPPM_DMM_SETPANELINFO (NPPMSG + 505)
+#endif
+
+struct tTbData {
+    void *hClient;
+    const char *pszName;
+    int dlgID;
+    unsigned int uMask;
+    void *hIconTab;
+    const char *pszAddInfo;
+    struct { int left, top, right, bottom; } rcFloat;
+    int iPrevCont;
+    const char *pszModuleName;
+};
+
+// Pointer at offset 0, command index at offset 8. The 1.1.1 host reads
+// exactly those two fields from NPPM_DMM_SETPANELINFO.
+struct NppPanelInfo {
+    const char *pszModuleName;
+    int dlgID;
+};
+
+static void cmdToggle(void);
 
 #define PLUGIN_NAME    "Semantic Search"
 #define PLUGIN_VERSION "1.0.0"
@@ -27,6 +57,56 @@ static uint64_t            gPanelHandle = 0;
 static SemanticPanel      *gPanel       = nil;
 static SemanticController *gController  = nil;
 static bool                gPanelShown  = false;
+static id                  gKeyMonitor  = nil;
+
+// Cmd+Option+F. The host menu uses Cmd+F (Find), Cmd+Shift+F (Find in
+// Files) and Cmd+Ctrl+F (full screen). Cmd+Option+F is not one of those.
+// ShortcutKey._key is the Windows virtual-key code; VK_F is 0x46.
+// kVK_ANSI_F, the matching Mac key code, is 3.
+static ShortcutKey gOpenShortcut = { false, true, false, true, 0x46 };
+static const unsigned short kMacKeyF = 3;
+
+static NSMenuItem *findHeatmapItem(NSMenu *menu) {
+    if (!menu) return nil;
+    for (NSMenuItem *item in menu.itemArray) {
+        if ([item.title isEqualToString:@"Semantic Heatmap Search"]) return item;
+        if (item.submenu) {
+            NSMenuItem *found = findHeatmapItem(item.submenu);
+            if (found) return found;
+        }
+    }
+    return nil;
+}
+
+// Nextpad++ 1.1.1 creates plugin menu items with an empty key equivalent
+// and does not read FuncItem._pShKey. Put the chord on the menu item when
+// we can find it, and also watch the key so the panel still opens if that
+// item is rebuilt without a shortcut. The monitor consumes the event, so
+// the menu action does not run a second time.
+static void bindSearchShortcut(void) {
+    NSMenuItem *item = findHeatmapItem(NSApp.mainMenu);
+    if (item && item.keyEquivalent.length == 0) {
+        item.keyEquivalent = @"f";
+        item.keyEquivalentModifierMask =
+            NSEventModifierFlagCommand | NSEventModifierFlagOption;
+    }
+    if (gKeyMonitor) return;
+    gKeyMonitor = [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown
+                                                        handler:^NSEvent *(NSEvent *event) {
+        if (event.isARepeat) return event;
+        NSEventModifierFlags mods = event.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask;
+        NSEventModifierFlags relevant = mods & (NSEventModifierFlagCommand |
+                                                NSEventModifierFlagOption |
+                                                NSEventModifierFlagControl |
+                                                NSEventModifierFlagShift);
+        if (event.keyCode == kMacKeyF &&
+            relevant == (NSEventModifierFlagCommand | NSEventModifierFlagOption)) {
+            cmdToggle();
+            return nil;
+        }
+        return event;
+    }];
+}
 
 static intptr_t npp(uint32_t msg, uintptr_t w = 0, intptr_t l = 0) {
     return gNppData._sendMessage(gNppData._nppHandle, msg, w, l);
@@ -47,6 +127,9 @@ static intptr_t npp(uint32_t msg, uintptr_t w = 0, intptr_t l = 0) {
 - (void)semanticPanelSensitivityDidChange:(NSInteger)sensitivity {
     gController.sensitivity = sensitivity;
 }
+- (void)semanticPanelModelDidChange:(NSString *)modelID {
+    gController.modelID = modelID;
+}
 - (void)semanticPanelBandMaskDidChange:(NSUInteger)mask {
     gController.bandMask = mask;
 }
@@ -66,6 +149,7 @@ static void ensurePanel(void) {
 
     gController = [SemanticController new];
     gController.sensitivity = gPanel.sensitivity;
+    gController.modelID = gPanel.modelID;
     __weak SemanticPanel *weakPanel = gPanel;
     gController.statusBlock = ^(NSString *status, BOOL busy) {
         [weakPanel setStatus:status busy:busy];
@@ -76,7 +160,7 @@ static void registerPanel(void) {
     if (gPanelHandle != 0) return;
     ensurePanel();
 
-    // Preferred: the Windows-named registration (host 1.1.1+) — carries the
+    // Preferred: the Windows-named registration (host 1.1.1+). It carries the
     // default-bottom dock hint and the session-restore metadata in one call.
     tTbData d;
     memset(&d, 0, sizeof(d));
@@ -88,8 +172,8 @@ static void registerPanel(void) {
     intptr_t h = npp(NPPM_DMMREGASDCKDLG, 0, (intptr_t)&d);
 
     if (h == 0) {
-        // Older host: legacy registration (docks right, no restore metadata
-        // unless SETPANELINFO exists — try it, ignore failure).
+        // Older host: legacy registration (docks right). Restore metadata is
+        // sent only when the host implements SETPANELINFO.
         h = npp(NPPM_DMM_REGISTERPANEL,
                 (uintptr_t)(__bridge void *)gPanel, (intptr_t)"Semantic Search");
         if (h > 0) {
@@ -109,6 +193,7 @@ static void showPanel(void) {
         return;
     }
     registerPanel();
+    bindSearchShortcut();
     if (gPanelHandle == 0) return;
 
     npp(NPPM_DMM_SHOWPANEL, (uintptr_t)gPanelHandle, 0);
@@ -134,8 +219,9 @@ static void cmdAbout(void) {
         NSAlert *a = [NSAlert new];
         a.messageText = @"Semantic Search v" @PLUGIN_VERSION;
         a.informativeText =
-            @"Semantic sentence heatmap search — describe what you're looking "
-            @"for and sentences are tinted red → grey → green by similarity.\n\n"
+            @"Semantic sentence heatmap search. Describe what you're looking "
+            @"for and sentences are tinted red, grey, then green by similarity.\n\n"
+            @"Open this panel from the Plugins menu or with Cmd+Option+F.\n\n"
             @"Apple NaturalLanguage embeddings + Metal/MPS scoring, entirely "
             @"on-device. Requires macOS 14+.\n\n"
             @"Based on Nextpad++ PR #346 by Kristian Rickert.\n"
@@ -161,6 +247,7 @@ extern "C" NPP_EXPORT void setInfo(NppData data) {
     };
     addItem("Semantic Heatmap Search", cmdToggle);   // 0 (== tTbData dlgID)
     addItem("About",                   cmdAbout);    // 1
+    funcItem[0]._pShKey = &gOpenShortcut;
 }
 
 extern "C" NPP_EXPORT const char *getName() { return PLUGIN_NAME; }
@@ -172,6 +259,10 @@ extern "C" NPP_EXPORT FuncItem *getFuncsArray(int *nbF) {
 
 extern "C" NPP_EXPORT void beNotified(SCNotification *n) {
     switch (n->nmhdr.code) {
+        case NPPN_READY:
+            bindSearchShortcut();
+            break;
+
         case NPPN_BUFFERACTIVATED:
             if (gPanelShown && gController) {
                 [gController attachToCurrentBuffer];
@@ -192,6 +283,10 @@ extern "C" NPP_EXPORT void beNotified(SCNotification *n) {
             break;
 
         case NPPN_SHUTDOWN:
+            if (gKeyMonitor) {
+                [NSEvent removeMonitor:gKeyMonitor];
+                gKeyMonitor = nil;
+            }
             [gController detach];
             if (gPanelHandle > 0) {
                 npp(NPPM_DMM_UNREGISTERPANEL, (uintptr_t)gPanelHandle, 0);
