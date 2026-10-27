@@ -1,3 +1,4 @@
+#include "BookmarkHandles.h"
 // SemanticSearch.macos — see SemanticController.h.
 // Pipeline logic derives from PR #346 (Kristian Rickert); the generation/
 // debounce/caching design is his, re-plumbed onto the plugin API.
@@ -70,9 +71,9 @@ struct SemSentenceSpan {
     NSInteger _sensitivity;
     NSUInteger _bandMask;    // bit i = band i selected; 0 = all bands
     int        _bookmarkID;  // host bookmark marker (NPPM_GETBOOKMARKID)
-    // Lines WE bookmarked, per buffer — so deselecting a band (or clearing)
+    // Marker handles WE own, per buffer — so deselecting a band (or clearing)
     // removes exactly what we added and never the user's own bookmarks.
-    std::map<intptr_t, std::set<long>> _ourBookmarks;
+    std::map<intptr_t, BookmarkHandles> _ourBookmarks;
     std::vector<SemanticHit> _lastHits;
     NSString *_indexStatus;
     NSString *_providerLanguage;
@@ -560,27 +561,17 @@ struct SemSentenceSpan {
 // Reconcile OUR bookmarks on the current buffer with `want`: remove lines we
 // added that are no longer wanted, add newly wanted lines — but never touch a
 // bookmark the user placed (add skips lines already marked; remove only
-// touches lines recorded as ours).
+// deletes marker handles recorded as ours).
 - (void)syncBookmarksTo:(const std::set<long> &)want {
     if (_bufferID == 0) return;
     const int bm = [self bookmarkID];
     const unsigned mask = 1u << bm;
-    std::set<long> &ours = _ourBookmarks[_bufferID];
-
-    for (auto it = ours.begin(); it != ours.end();) {
-        if (want.count(*it) == 0) {
-            sci(SCI_MARKERDELETE, (uptr_t)*it, bm);
-            it = ours.erase(it);
-        } else {
-            ++it;
-        }
-    }
-    for (long line : want) {
-        if (ours.count(line)) continue;
-        if ((unsigned)sci(SCI_MARKERGET, (uptr_t)line) & mask) continue; // user's
-        sci(SCI_MARKERADD, (uptr_t)line, bm);
-        ours.insert(line);
-    }
+    auto &ours = _ourBookmarks[_bufferID];
+    syncBookmarkHandles(ours, want, mask,
+        [&](int handle) { return (long)sci(SCI_MARKERLINEFROMHANDLE, (uptr_t)handle); },
+        [&](int handle) { sci(SCI_MARKERDELETEHANDLE, (uptr_t)handle); },
+        [&](long line) { return (unsigned)sci(SCI_MARKERGET, (uptr_t)line); },
+        [&](long line) { return (int)sci(SCI_MARKERADD, (uptr_t)line, bm); });
 }
 
 - (void)clearHeatmap {
@@ -599,7 +590,7 @@ struct SemSentenceSpan {
 }
 
 /// A buffer died — forget its bookmark record so a later buffer-id reuse
-/// can never inherit stale line numbers.
+/// can never inherit stale marker handles.
 - (void)noteFileClosed:(intptr_t)bufferID {
     _ourBookmarks.erase(bufferID);
 }

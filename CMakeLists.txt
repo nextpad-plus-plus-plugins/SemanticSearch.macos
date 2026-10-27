@@ -58,3 +58,8 @@ target_compile_options(semantic_segment_test PRIVATE -fobjc-arc)
 target_include_directories(semantic_segment_test PRIVATE src/engine)
 target_link_libraries(semantic_segment_test PRIVATE "-framework Foundation")
 add_test(NAME semantic_segment COMMAND semantic_segment_test)
+
+add_executable(semantic_bookmarks_test test/bookmark_handles_test.cpp)
+target_compile_features(semantic_bookmarks_test PRIVATE cxx_std_17)
+target_include_directories(semantic_bookmarks_test PRIVATE src)
+add_test(NAME semantic_bookmarks COMMAND semantic_bookmarks_test)
